@@ -24,9 +24,11 @@ ClockState currentState = MODE_CLOCK;
 enum MenuOption { MENU_EXIT, MENU_TOGGLE_DST, MENU_DIMMER, MENU_RESET_WIFI };
 MenuOption currentMenu = MENU_EXIT;
 
-// Button tracking
+// --- Button tracking ---
 unsigned long buttonPressTime = 0;
 bool buttonIsPressed = false;
+bool longPressExecuted =
+    false; // NEW: Tracks if we already fired the long press
 
 // for Daylight Saving Time
 bool dstEnabled = false;
@@ -105,23 +107,74 @@ void loop() {
   // --- Button Reading Logic ---
   bool currentReading = (digitalRead(BUTTON_PIN) == LOW);
 
-  if (currentReading && !buttonIsPressed) {
-    // Button just went down
-    buttonPressTime = millis();
-    buttonIsPressed = true;
-  } else if (!currentReading && buttonIsPressed) {
-    // Button just went up
+  if (currentReading) {
+    // 1. Button just went down
+    if (!buttonIsPressed) {
+      buttonPressTime = millis();
+      buttonIsPressed = true;
+      longPressExecuted = false; // Reset the flag for this new press
+    }
+    // 2. Button is being held down
+    else {
+      unsigned long pressDuration = millis() - buttonPressTime;
+
+      // --- LONG PRESS ACTION (Triggers immediately while holding) ---
+      if (pressDuration >= 800 && !longPressExecuted) {
+        longPressExecuted = true; // Lock it so it only fires once
+
+        if (currentState == MODE_MENU) {
+          if (currentMenu == MENU_EXIT) {
+            currentState = MODE_CLOCK;
+            vfd.print("EXITING ");
+            delay(1000);
+            vfd.initFramebuffer();
+          } else if (currentMenu == MENU_RESET_WIFI) {
+            resetWiFiAndReboot();
+          } else if (currentMenu == MENU_TOGGLE_DST) {
+            dstEnabled = !dstEnabled;
+            File f = LittleFS.open("/dst.txt", "w");
+            if (f) {
+              f.print(dstEnabled ? "1" : "0");
+              f.close();
+            }
+            vfd.print("SAVED   ");
+            delay(1000);
+            currentState = MODE_CLOCK;
+            vfd.initFramebuffer();
+          } else if (currentMenu == MENU_DIMMER) {
+            currentState = MODE_DIMMER;
+            char lvlStr[9];
+            snprintf(lvlStr, sizeof(lvlStr), "LEVEL: %d", currentDimLevel);
+            vfd.print(lvlStr);
+          }
+        } else if (currentState == MODE_DIMMER) {
+          // Save Dimmer and Exit
+          File f = LittleFS.open("/dim.txt", "w");
+          if (f) {
+            f.print(currentDimLevel);
+            f.close();
+          }
+          vfd.print("SAVED   ");
+          delay(1000);
+          currentState = MODE_CLOCK;
+          vfd.initFramebuffer();
+        }
+      }
+    }
+  }
+  // 3. Button just went up
+  else if (!currentReading && buttonIsPressed) {
     unsigned long pressDuration = millis() - buttonPressTime;
     buttonIsPressed = false;
 
-    // 1. SHORT PRESS: Cycle through menus
-    if (pressDuration > 50 && pressDuration < 800) {
+    // --- SHORT PRESS ACTION (Only fires if we didn't just do a long press) ---
+    if (pressDuration > 50 && !longPressExecuted) {
       if (currentState == MODE_CLOCK) {
         currentState = MODE_MENU;
         currentMenu = MENU_EXIT;
         vfd.print("MENU:EXT");
       } else if (currentState == MODE_MENU) {
-        // Main Menu Cycle
+        // Cycle Menu
         if (currentMenu == MENU_EXIT) {
           currentMenu = MENU_TOGGLE_DST;
           vfd.print(dstEnabled ? "DST->OFF" : "DST->ON ");
@@ -135,69 +188,15 @@ void loop() {
           currentMenu = MENU_EXIT;
           vfd.print("MENU:EXT");
         }
-      }
-      // --- THE NEW SUB-MENU CYCLE ---
-      else if (currentState == MODE_DIMMER) {
+      } else if (currentState == MODE_DIMMER) {
+        // Cycle Brightness
         currentDimLevel++;
         if (currentDimLevel > 8)
-          currentDimLevel = 1; // Wrap around
-
-        // Live Preview: Apply the brightness immediately!
+          currentDimLevel = 1;
         vfd.setBrightness(dimValues[currentDimLevel - 1]);
-
-        // Print the level to the screen
         char lvlStr[9];
         snprintf(lvlStr, sizeof(lvlStr), "LEVEL: %d", currentDimLevel);
         vfd.print(lvlStr);
-      }
-    }
-
-    // 2. LONG PRESS: Select the current option
-    else if (pressDuration >= 800) {
-      if (currentState == MODE_MENU) {
-        if (currentMenu == MENU_EXIT) {
-          currentState = MODE_CLOCK;
-          vfd.print("EXITING ");
-          delay(1000);
-          vfd.initFramebuffer();
-        } else if (currentMenu == MENU_RESET_WIFI) {
-          resetWiFiAndReboot();
-        } else if (currentMenu == MENU_TOGGLE_DST) {
-          dstEnabled = !dstEnabled;
-          File f = LittleFS.open("/dst.txt", "w");
-          if (f) {
-            f.print(dstEnabled ? "1" : "0");
-            f.close();
-          }
-          vfd.print("SAVED   ");
-          delay(1000);
-          currentState = MODE_CLOCK;
-          vfd.initFramebuffer();
-        }
-        // --- DIVE INTO SUB-MENU ---
-        else if (currentMenu == MENU_DIMMER) {
-          currentState = MODE_DIMMER; // Switch to dimmer state
-
-          char lvlStr[9];
-          snprintf(lvlStr, sizeof(lvlStr), "LEVEL: %d", currentDimLevel);
-          vfd.print(lvlStr);
-        }
-      }
-      // --- SAVE AND EXIT SUB-MENU ---
-      else if (currentState == MODE_DIMMER) {
-        // Save the chosen level to LittleFS
-        File f = LittleFS.open("/dim.txt", "w");
-        if (f) {
-          f.print(currentDimLevel);
-          f.close();
-        }
-
-        vfd.print("SAVED   ");
-        delay(1000);
-
-        // Return all the way to the clock
-        currentState = MODE_CLOCK;
-        vfd.initFramebuffer();
       }
     }
   }
