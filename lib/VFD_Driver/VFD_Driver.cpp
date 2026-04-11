@@ -50,3 +50,39 @@ void VFD_Driver::setBrightness(uint8_t level) {
     level = constrain(level, 0, max_brightness);
     writeCommand(cmd_set_dimming, level);
 }
+
+// Define the font map (0-9, Space, Colon)
+const uint8_t VFD_Driver::font5x7[12][5] = {
+  {0x3E, 0x51, 0x49, 0x45, 0x3E}, // 0
+  {0x00, 0x42, 0x7F, 0x40, 0x00}, // 1
+  {0x42, 0x61, 0x51, 0x49, 0x46}, // 2
+  {0x21, 0x41, 0x45, 0x4B, 0x31}, // 3
+  {0x18, 0x14, 0x12, 0x7F, 0x10}, // 4
+  {0x27, 0x45, 0x45, 0x45, 0x39}, // 5
+  {0x3C, 0x4A, 0x49, 0x49, 0x30}, // 6
+  {0x01, 0x71, 0x09, 0x05, 0x03}, // 7
+  {0x36, 0x49, 0x49, 0x49, 0x36}, // 8
+  {0x06, 0x49, 0x49, 0x29, 0x1E}, // 9
+  {0x00, 0x00, 0x00, 0x00, 0x00}, // 10 (Space)
+  {0x00, 0x36, 0x36, 0x00, 0x00}  // 11 (Colon)
+};
+
+// Writes 5 bytes of pixel data to a specific CGRAM slot (0-7)
+void VFD_Driver::setCGRAM(uint8_t slot, uint8_t* columns) {
+    digitalWrite(_cs, LOW);
+    sendByte(0x40 + (slot & 0x07)); // 0x40 is the base CGRAM write command
+    for(int i = 0; i < 5; i++) {
+        sendByte(columns[i]);
+    }
+    digitalWrite(_cs, HIGH);
+}
+
+// Fills the screen with CGRAM slots 0-7 permanently
+void VFD_Driver::initFramebuffer() {
+    digitalWrite(_cs, LOW);
+    sendByte(0x20); // DCRAM Address 0
+    for (uint8_t i = 0; i < 8; i++) {
+        sendByte(i); // Write char codes 0x00 to 0x07 (the CGRAM addresses)
+    }
+    digitalWrite(_cs, HIGH);
+}

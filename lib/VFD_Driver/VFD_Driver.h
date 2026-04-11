@@ -14,6 +14,12 @@ public:
   // Set number of display digits
   void setDigit(uint8_t digit);
 
+  void setCGRAM(uint8_t slot, uint8_t *columns);
+  void initFramebuffer();
+
+  // 5x7 Font Data for 0-9, Space, and Colon
+  static const uint8_t font5x7[12][5];
+
 private:
   uint8_t _cs{}, _clk{}, _data{};
   static constexpr uint32_t default_brightness{120}; // Default brightness value
