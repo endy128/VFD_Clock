@@ -18,7 +18,7 @@ uint8_t currentDimLevel = 4; // Default to Level 4 (120)
 const uint8_t dimValues[8] = {30, 60, 90, 120, 150, 180, 210, 240};
 
 // --- Menu State Machine ---
-enum ClockState { MODE_CLOCK, MODE_MENU, MODE_DIMMER };
+enum ClockState { MODE_CLOCK, MODE_DATE, MODE_MENU, MODE_DIMMER };
 ClockState currentState = MODE_CLOCK;
 
 enum MenuOption { MENU_EXIT, MENU_TOGGLE_DST, MENU_DIMMER, MENU_RESET_WIFI };
@@ -27,16 +27,17 @@ MenuOption currentMenu = MENU_EXIT;
 // --- Button tracking ---
 unsigned long buttonPressTime = 0;
 bool buttonIsPressed = false;
-bool longPressExecuted =
-    false; // NEW: Tracks if we already fired the long press
+// Tracks if we already fired the long press
+bool longPressExecuted = false;
 
 // for Daylight Saving Time
 bool dstEnabled = false;
 
+// Tells the loop whether to update the portal
+bool wifiManagerActive = false;
+
 void setup() {
   vfd.begin();
-
-  // Set button with internal pullup (reads LOW when pressed)
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   if (!LittleFS.begin()) {
@@ -44,7 +45,7 @@ void setup() {
     return;
   }
 
-  // Load DST preference from memory
+  // 1. Load User Preferences (DST and Dimmer)
   if (LittleFS.exists("/dst.txt")) {
     File f = LittleFS.open("/dst.txt", "r");
     if (f) {
@@ -53,24 +54,19 @@ void setup() {
     }
   }
 
-  // Load Dimmer preference from memory
   if (LittleFS.exists("/dim.txt")) {
     File f = LittleFS.open("/dim.txt", "r");
     if (f) {
       currentDimLevel = f.readString().toInt();
-      // Sanity check in case the file gets corrupted
       if (currentDimLevel < 1 || currentDimLevel > 8)
         currentDimLevel = 4;
       f.close();
     }
   }
-
-  // Apply the loaded brightness
   vfd.setBrightness(dimValues[currentDimLevel - 1]);
 
-  vfd.initFramebuffer();
-  vfd.print("HELLO :)");
-  WiFi.disconnect();
+  // 2. Let the Library handle the Fast Connect
+  vfd.print("WIFI... ");
 
   wm.setHostname("VFDClock");
   wm.setAPCredentials("VFD-Clock", "12345678");
@@ -79,13 +75,45 @@ void setup() {
   wm.setWebClientCheck(true);
 
   wm.begin();
-  wm.run();
+  wm.run(); // This will auto-connect instantly if it has the JSON keys!
 
-  if (WiFi.status() != WL_CONNECTED) {
-    vfd.print("SET WIFI");
-  } else {
+  // 3. The "Stealth" Takeover
+  if (WiFi.status() == WL_CONNECTED) {
     vfd.print("SYNCING ");
+    configTime(0, 0, "pool.ntp.org");
+
+    // Wait for the atomic time to arrive
+    int retries = 0;
+    time_t now = time(nullptr);
+    while (now < 100000 && retries < 20) {
+      delay(500);
+      now = time(nullptr);
+      retries++;
+    }
+
+    if (now > 100000) {
+      vfd.print("RADIOOFF");
+      delay(1000);
+
+      // We have the time. Kill the RF hardware to save heat!
+      WiFi.disconnect();
+      WiFi.mode(WIFI_OFF);
+      wifiManagerActive = false; // Tell the loop to ignore wm.update()
+      // Manually turn off the ESP-12F Blue LED (Active-Low)
+      pinMode(2, OUTPUT);
+      digitalWrite(2, HIGH);
+    } else {
+      // Failed to get NTP time, keep manager alive just in case
+      wifiManagerActive = true;
+    }
+  } else {
+    // No credentials or bad password. Portal is running.
+    vfd.print("SET WIFI");
+    wifiManagerActive = true;
   }
+
+  // Switch to animation mode
+  vfd.initFramebuffer();
 }
 
 // Helper function to wipe the credentials
@@ -102,7 +130,17 @@ void resetWiFiAndReboot() {
 }
 
 void loop() {
-  wm.update();
+  // Only update the portal if the Fast Boot failed
+  if (wifiManagerActive) {
+    wm.update();
+  }
+
+  // --- STEALTH SYNC VARIABLES ---
+  static bool isStealthSyncing = false;
+  static unsigned long syncStartTime = 0;
+  static unsigned long connectedTime = 0;
+  static int lastSyncDay =
+      -1; // Prevents it from syncing multiple times in the same minute
 
   // --- Button Reading Logic ---
   bool currentReading = (digitalRead(BUTTON_PIN) == LOW);
@@ -122,7 +160,12 @@ void loop() {
       if (pressDuration >= 800 && !longPressExecuted) {
         longPressExecuted = true; // Lock it so it only fires once
 
-        if (currentState == MODE_MENU) {
+        // --- NEW: LONG PRESS ENTERS MENU ---
+        if (currentState == MODE_CLOCK || currentState == MODE_DATE) {
+          currentState = MODE_MENU;
+          currentMenu = MENU_EXIT;
+          vfd.print("MENU:EXT");
+        } else if (currentState == MODE_MENU) {
           if (currentMenu == MENU_EXIT) {
             currentState = MODE_CLOCK;
             vfd.print("EXITING ");
@@ -169,10 +212,12 @@ void loop() {
 
     // --- SHORT PRESS ACTION (Only fires if we didn't just do a long press) ---
     if (pressDuration > 50 && !longPressExecuted) {
+
+      // --- NEW: SHORT PRESS TRIGGERS DATE PEEK ---
       if (currentState == MODE_CLOCK) {
-        currentState = MODE_MENU;
-        currentMenu = MENU_EXIT;
-        vfd.print("MENU:EXT");
+        currentState = MODE_DATE;
+      } else if (currentState == MODE_DATE) {
+        currentState = MODE_CLOCK; // Tap again to manually dismiss early
       } else if (currentState == MODE_MENU) {
         // Cycle Menu
         if (currentMenu == MENU_EXIT) {
@@ -201,8 +246,8 @@ void loop() {
     }
   }
 
-  // --- Clock Display Logic ---
-  if (currentState == MODE_CLOCK) {
+  // --- Clock & Date Display Logic ---
+  if (currentState == MODE_CLOCK || currentState == MODE_DATE) {
     static int lastSecond = -1;
     static char currentText[9] = "        ";
     static char targetText[9] = "        ";
@@ -210,6 +255,10 @@ void loop() {
     static bool isAnimating = false;
     static int animStep = 0;
     static unsigned long lastAnimTime = 0;
+    static bool animDirectionUp = false; // NEW: Controls slide direction
+
+    static unsigned long dateShowTime = 0;
+    static bool dateInitialized = false;
 
     time_t raw_now = time(nullptr);
 
@@ -220,21 +269,80 @@ void loop() {
       time_t displayTime = raw_now + (dstEnabled ? 3600 : 0);
       struct tm *timeInfo = localtime(&displayTime);
 
-      // Check if the second changed
-      if (timeInfo->tm_sec != lastSecond) {
-        if (lastSecond == -1) {
-          vfd.initFramebuffer();
-        }
-        lastSecond = timeInfo->tm_sec;
+      // --- 2 AM STEALTH SYNC ENGINE ---
+      if (timeInfo->tm_hour == 2 && timeInfo->tm_min == 0 &&
+          timeInfo->tm_sec == 0 && lastSyncDay != timeInfo->tm_yday) {
+        isStealthSyncing = true;
+        lastSyncDay = timeInfo->tm_yday;
+        syncStartTime = millis();
+        connectedTime = 0;
+        WiFi.mode(WIFI_STA);
+        WiFi.begin();
+        digitalWrite(2, LOW);
+      }
 
-        // Update target text using the adjusted displayTime
-        strftime(targetText, sizeof(targetText), "%H:%M:%S", timeInfo);
-
-        // Start animation if it's not already running
-        if (!isAnimating) {
-          isAnimating = true;
-          animStep = 1;
+      if (isStealthSyncing) {
+        if (millis() - syncStartTime > 15000) {
+          isStealthSyncing = false;
+          WiFi.disconnect();
+          WiFi.mode(WIFI_OFF);
+          pinMode(2, OUTPUT);
+          digitalWrite(2, HIGH);
+        } else if (WiFi.status() == WL_CONNECTED) {
+          if (connectedTime == 0) {
+            connectedTime = millis();
+            configTime(0, 0, "pool.ntp.org");
+          }
+          if (millis() - connectedTime > 5000) {
+            isStealthSyncing = false;
+            WiFi.disconnect();
+            WiFi.mode(WIFI_OFF);
+            pinMode(2, OUTPUT);
+            digitalWrite(2, HIGH);
+          }
         }
+      }
+      // --------------------------------
+
+      // --- DATE MODE LOGIC ---
+      if (currentState == MODE_DATE) {
+        if (!dateInitialized) {
+          dateInitialized = true;
+          dateShowTime = millis();
+          animDirectionUp = false; // Drop the date down
+
+          strftime(targetText, sizeof(targetText), "%d %m %y", timeInfo);
+        }
+
+        // After 3 seconds, automatically revert to Clock Mode
+        if (millis() - dateShowTime > 3000) {
+          currentState = MODE_CLOCK;
+          dateInitialized = false;
+          animDirectionUp = true; // Slide the time back UP!
+
+          // Force update the target text instantly so the slide-up has a
+          // destination
+          strftime(targetText, sizeof(targetText), "%H:%M:%S", timeInfo);
+        }
+      }
+      // --- CLOCK MODE LOGIC ---
+      else {
+        // Check if the second changed
+        if (timeInfo->tm_sec != lastSecond) {
+          if (lastSecond == -1)
+            vfd.initFramebuffer(); // Only call this on very first boot
+          lastSecond = timeInfo->tm_sec;
+
+          strftime(targetText, sizeof(targetText), "%H:%M:%S", timeInfo);
+        }
+      }
+
+      // --- UNIVERSAL ANIMATION TRIGGER ---
+      // If the text changed for ANY reason (time tick or button press), animate
+      // it!
+      if (!isAnimating && strcmp(currentText, targetText) != 0) {
+        isAnimating = true;
+        animStep = 1;
       }
     }
 
@@ -246,7 +354,7 @@ void loop() {
       for (int pos = 0; pos < 8; pos++) {
         uint8_t blendedCols[5];
 
-        // Convert ASCII characters to our font array indices
+        // Convert ASCII to font array indices
         int oldFontIdx =
             (currentText[pos] == ':')
                 ? 11
@@ -256,19 +364,21 @@ void loop() {
                 ? 11
                 : (targetText[pos] == ' ' ? 10 : targetText[pos] - '0');
 
-        // If the character isn't changing, just keep it static
         if (oldFontIdx == newFontIdx) {
           vfd.setCGRAM(pos, (uint8_t *)vfd.font5x7[oldFontIdx]);
-        }
-        // If it IS changing, calculate the blend
-        else {
+        } else {
           for (int c = 0; c < 5; c++) {
             uint8_t oldCol = vfd.font5x7[oldFontIdx][c];
             uint8_t newCol = vfd.font5x7[newFontIdx][c];
 
-            // The magical drop-down math
-            blendedCols[c] = ((oldCol << animStep) & 0x7F) |
-                             ((newCol >> (7 - animStep)) & 0x7F);
+            // Bidirectional Slide Math
+            if (animDirectionUp) {
+              blendedCols[c] = ((oldCol >> animStep) & 0x7F) |
+                               ((newCol << (7 - animStep)) & 0x7F);
+            } else {
+              blendedCols[c] = ((oldCol << animStep) & 0x7F) |
+                               ((newCol >> (7 - animStep)) & 0x7F);
+            }
           }
           vfd.setCGRAM(pos, blendedCols);
         }
@@ -279,8 +389,9 @@ void loop() {
       // When animation finishes, lock the new text in
       if (animStep > 7) {
         isAnimating = false;
-        strcpy(currentText, targetText); // The target is now the current
+        strcpy(currentText, targetText);
+        animDirectionUp = false; // Reset direction back to normal downward flap
       }
     }
   }
-}
+} // End of loop()
