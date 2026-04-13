@@ -246,32 +246,20 @@ void loop() {
     }
   }
 
-  // --- Clock & Date Display Logic ---
+// --- Clock & Date Display Logic ---
   if (currentState == MODE_CLOCK || currentState == MODE_DATE) {
     static int lastSecond = -1;
-    static char currentText[9] = "        ";
-    static char targetText[9] = "        ";
-
-    static bool isAnimating = false;
-    static int animStep = 0;
-    static unsigned long lastAnimTime = 0;
-    static bool animDirectionUp = false; // NEW: Controls slide direction
-
     static unsigned long dateShowTime = 0;
     static bool dateInitialized = false;
 
     time_t raw_now = time(nullptr);
 
-    // Only process if NTP has synced
     if (raw_now > 100000) {
-
-      // Apply DST offset (+3600 seconds)
       time_t displayTime = raw_now + (dstEnabled ? 3600 : 0);
       struct tm *timeInfo = localtime(&displayTime);
 
       // --- 2 AM STEALTH SYNC ENGINE ---
-      if (timeInfo->tm_hour == 2 && timeInfo->tm_min == 0 &&
-          timeInfo->tm_sec == 0 && lastSyncDay != timeInfo->tm_yday) {
+      if (timeInfo->tm_hour == 2 && timeInfo->tm_min == 0 && timeInfo->tm_sec == 0 && lastSyncDay != timeInfo->tm_yday) {
         isStealthSyncing = true;
         lastSyncDay = timeInfo->tm_yday;
         syncStartTime = millis();
@@ -286,8 +274,7 @@ void loop() {
           isStealthSyncing = false;
           WiFi.disconnect();
           WiFi.mode(WIFI_OFF);
-          pinMode(2, OUTPUT);
-          digitalWrite(2, HIGH);
+          pinMode(2, OUTPUT); digitalWrite(2, HIGH);
         } else if (WiFi.status() == WL_CONNECTED) {
           if (connectedTime == 0) {
             connectedTime = millis();
@@ -297,101 +284,47 @@ void loop() {
             isStealthSyncing = false;
             WiFi.disconnect();
             WiFi.mode(WIFI_OFF);
-            pinMode(2, OUTPUT);
-            digitalWrite(2, HIGH);
+            pinMode(2, OUTPUT); digitalWrite(2, HIGH);
           }
         }
       }
       // --------------------------------
+
+      char targetText[9] = "        ";
 
       // --- DATE MODE LOGIC ---
       if (currentState == MODE_DATE) {
         if (!dateInitialized) {
           dateInitialized = true;
           dateShowTime = millis();
-          animDirectionUp = false; // Drop the date down
-
-          strftime(targetText, sizeof(targetText), "%d %m %y", timeInfo);
+          
+          // Using the new dash formatting!
+          strftime(targetText, sizeof(targetText), "%d-%m-%y", timeInfo);
+          vfd.animateTo(targetText, false); // Slide down
         }
 
-        // After 3 seconds, automatically revert to Clock Mode
+        // Revert to Clock Mode after 3 seconds
         if (millis() - dateShowTime > 3000) {
           currentState = MODE_CLOCK;
           dateInitialized = false;
-          animDirectionUp = true; // Slide the time back UP!
-
-          // Force update the target text instantly so the slide-up has a
-          // destination
+          
           strftime(targetText, sizeof(targetText), "%H:%M:%S", timeInfo);
+          vfd.animateTo(targetText, true); // Slide up!
         }
       }
       // --- CLOCK MODE LOGIC ---
       else {
-        // Check if the second changed
         if (timeInfo->tm_sec != lastSecond) {
-          if (lastSecond == -1)
-            vfd.initFramebuffer(); // Only call this on very first boot
+          if (lastSecond == -1) vfd.initFramebuffer(); 
           lastSecond = timeInfo->tm_sec;
 
           strftime(targetText, sizeof(targetText), "%H:%M:%S", timeInfo);
+          vfd.animateTo(targetText, false); // Normal second tick slides down
         }
-      }
-
-      // --- UNIVERSAL ANIMATION TRIGGER ---
-      // If the text changed for ANY reason (time tick or button press), animate
-      // it!
-      if (!isAnimating && strcmp(currentText, targetText) != 0) {
-        isAnimating = true;
-        animStep = 1;
       }
     }
 
-    // 2. Handle the Animation Frames (Non-blocking)
-    if (isAnimating && (millis() - lastAnimTime > 25)) { // 25ms per frame
-      lastAnimTime = millis();
-
-      // Update all 8 characters
-      for (int pos = 0; pos < 8; pos++) {
-        uint8_t blendedCols[5];
-
-        // Convert ASCII to font array indices
-        int oldFontIdx =
-            (currentText[pos] == ':')
-                ? 11
-                : (currentText[pos] == ' ' ? 10 : currentText[pos] - '0');
-        int newFontIdx =
-            (targetText[pos] == ':')
-                ? 11
-                : (targetText[pos] == ' ' ? 10 : targetText[pos] - '0');
-
-        if (oldFontIdx == newFontIdx) {
-          vfd.setCGRAM(pos, (uint8_t *)vfd.font5x7[oldFontIdx]);
-        } else {
-          for (int c = 0; c < 5; c++) {
-            uint8_t oldCol = vfd.font5x7[oldFontIdx][c];
-            uint8_t newCol = vfd.font5x7[newFontIdx][c];
-
-            // Bidirectional Slide Math
-            if (animDirectionUp) {
-              blendedCols[c] = ((oldCol >> animStep) & 0x7F) |
-                               ((newCol << (7 - animStep)) & 0x7F);
-            } else {
-              blendedCols[c] = ((oldCol << animStep) & 0x7F) |
-                               ((newCol >> (7 - animStep)) & 0x7F);
-            }
-          }
-          vfd.setCGRAM(pos, blendedCols);
-        }
-      }
-
-      animStep++;
-
-      // When animation finishes, lock the new text in
-      if (animStep > 7) {
-        isAnimating = false;
-        strcpy(currentText, targetText);
-        animDirectionUp = false; // Reset direction back to normal downward flap
-      }
-    }
+    // Tell the VFD driver to process any pending animation frames
+    vfd.updateAnimation();
   }
 } // End of loop()

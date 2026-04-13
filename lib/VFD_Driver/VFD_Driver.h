@@ -11,30 +11,39 @@ public:
   void writeCommand(uint8_t cmd, uint8_t data = 0xFF);
   void print(const char *msg);
   void setBrightness(uint8_t level);
-  // Set number of display digits
   void setDigit(uint8_t digit);
 
   void setCGRAM(uint8_t slot, uint8_t *columns);
   void initFramebuffer();
 
-  // 5x7 Font Data for 0-9, Space, and Colon
-  static const uint8_t font5x7[12][5];
+  // --- NEW: Animation Engine Interface ---
+  void animateTo(const char* targetText, bool slideUp = false);
+  void updateAnimation();
+  bool isAnimating() const { return _isAnimating; }
 
 private:
   uint8_t _cs{}, _clk{}, _data{};
-  static constexpr uint32_t default_brightness{120}; // Default brightness value
-  static constexpr uint32_t max_brightness{240};     // Maximum brightness value
+  static constexpr uint32_t default_brightness{120}; 
+  static constexpr uint32_t max_brightness{240};     
 
-  // Directly followed by brightness value (1 byte, max 240), total 2 bytes
   static constexpr uint8_t cmd_set_dimming{0xE4};
-
-  // Directly followed by digit count (7 bits), total 2 bytes
   static constexpr uint8_t cmd_set_digit{0xE0};
-
-  // Send directly, total 1 byte
   static constexpr uint8_t cmd_display_on{0xE8};
 
   void sendByte(uint8_t data);
+
+  // --- NEW: Animation Engine Variables ---
+  // Expanded to 13 to include the new Dash character
+  static const uint8_t font5x7[13][5]; 
+  
+  uint8_t charToFontIdx(char c);
+
+  bool _isAnimating{false};
+  int _animStep{0};
+  unsigned long _lastAnimTime{0};
+  bool _animDirectionUp{false};
+  char _currentText[9]{"        "};
+  char _targetText[9]{"        "};
 };
 
 #endif
