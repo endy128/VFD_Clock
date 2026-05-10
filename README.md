@@ -1,5 +1,7 @@
 # VFD Clock from AliExpress (Enhanced ESP12 Firmware)
 
+![VFD CLock from AliExpress](image.jpg)
+
 A complete firmware overhaul for the popular USB-powered VFD clocks found on AliExpress. This project transforms a basic clock into a highly optimized, internet-synced timepiece with custom mechanical-style animations and advanced power management.
 
 ## Hardware Info
