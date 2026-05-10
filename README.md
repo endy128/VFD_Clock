@@ -84,3 +84,8 @@ Accessed via a single button (Short press for Date, Long press for Menu):
 
 If the clock boots to `SET WIFI`, connect to the VFD-Clock access point on your phone to enter your local network credentials. The clock will remember these and skip the portal on the next boot!
 
+### WiFi Portal Credentials
+
+- SSID: `VFD-Clock`
+- Pass: `12345678`
+
