@@ -17,6 +17,7 @@ public:
   void initFramebuffer();
 
   // --- NEW: Animation Engine Interface ---
+  void setAnimStyle(uint8_t style);
   void animateTo(const char* targetText, bool slideUp = false);
   void updateAnimation();
   bool isAnimating() const { return _isAnimating; }
@@ -37,6 +38,7 @@ private:
   static const uint8_t font5x7[13][5]; 
   
   uint8_t charToFontIdx(char c);
+  uint8_t _animStyle{0}; // 0 = Drop, 1 = Fade
 
   bool _isAnimating{false};
   int _animStep{0};

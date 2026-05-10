@@ -106,10 +106,18 @@ void VFD_Driver::animateTo(const char* targetText, bool slideUp) {
     }
 }
 
+void VFD_Driver::setAnimStyle(uint8_t style) {
+    _animStyle = style;
+}
+
 void VFD_Driver::updateAnimation() {
     if (!_isAnimating) return;
 
-    if (millis() - _lastAnimTime > 25) { 
+    // --- NEW: DYNAMIC SPEED ---
+    // Drop is fast (25ms), Fade is slow and deliberate (60ms)
+    unsigned long frameDelay = (_animStyle == 1) ? 60 : 25;
+
+    if (millis() - _lastAnimTime > frameDelay) { 
         _lastAnimTime = millis();
 
         for (int pos = 0; pos < 8; pos++) {
@@ -124,10 +132,33 @@ void VFD_Driver::updateAnimation() {
                     uint8_t oldCol = font5x7[oldFontIdx][c];
                     uint8_t newCol = font5x7[newFontIdx][c];
 
-                    if (_animDirectionUp) {
-                        blendedCols[c] = ((oldCol >> _animStep) & 0x7F) | ((newCol << (7 - _animStep)) & 0x7F);
-                    } else {
-                        blendedCols[c] = ((oldCol << _animStep) & 0x7F) | ((newCol >> (7 - _animStep)) & 0x7F);
+                    // --- STYLE 0: THE DROP ---
+                    if (_animStyle == 0) {
+                        if (_animDirectionUp) {
+                            blendedCols[c] = ((oldCol >> _animStep) & 0x7F) | ((newCol << (7 - _animStep)) & 0x7F);
+                        } else {
+                            blendedCols[c] = ((oldCol << _animStep) & 0x7F) | ((newCol >> (7 - _animStep)) & 0x7F);
+                        }
+                    } 
+                    // --- STYLE 1: THE DISSOLVE FADE ---
+                    else if (_animStyle == 1) {
+                        uint8_t mask = 0;
+                        bool evenCol = (c % 2 == 0);
+                        
+                        // A cumulative 8-step disintegration mask
+                        switch (_animStep) {
+                            case 0: mask = 0x00; break;                  // 0%
+                            case 1: mask = evenCol ? 0x08 : 0x00; break; // Center dots appear
+                            case 2: mask = evenCol ? 0x28 : 0x10; break; // Sparse static
+                            case 3: mask = evenCol ? 0x2A : 0x54; break; // Dense static
+                            case 4: mask = evenCol ? 0x55 : 0x2A; break; // 50% Perfect Checkerboard
+                            case 5: mask = evenCol ? 0x75 : 0x6B; break; // Melting into new number
+                            case 6: mask = evenCol ? 0x7D : 0x7F; break; // Almost solid
+                            case 7: mask = 0x7F; break;                  // 100% New number
+                            default: mask = 0x7F; break;
+                        }
+                        
+                        blendedCols[c] = (oldCol & ~mask) | (newCol & mask);
                     }
                 }
                 setCGRAM(pos, blendedCols);

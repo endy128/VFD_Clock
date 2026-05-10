@@ -13,15 +13,25 @@
 VFD_Driver vfd(CS_PIN, CLK_PIN, DATA_PIN);
 AyresWiFiManager wm;
 
+// --- Animation Style Globals ---
+uint8_t currentAnimStyle = 0; // 0 = Drop, 1 = Fade
+
 // --- Dimmer Globals ---
 uint8_t currentDimLevel = 4; // Default to Level 4 (120)
 const uint8_t dimValues[8] = {30, 60, 90, 120, 150, 180, 210, 240};
 
 // --- Menu State Machine ---
-enum ClockState { MODE_CLOCK, MODE_DATE, MODE_MENU, MODE_DIMMER };
+enum ClockState { MODE_CLOCK, MODE_DATE, MODE_MENU, MODE_DIMMER, MODE_ANIM };
 ClockState currentState = MODE_CLOCK;
 
-enum MenuOption { MENU_EXIT, MENU_TOGGLE_DST, MENU_DIMMER, MENU_RESET_WIFI };
+enum MenuOption {
+  MENU_EXIT,
+  MENU_TOGGLE_DST,
+  MENU_TOGGLE_12_24,
+  MENU_ANIM,
+  MENU_DIMMER,
+  MENU_RESET_WIFI
+};
 MenuOption currentMenu = MENU_EXIT;
 
 // --- Button tracking ---
@@ -32,6 +42,8 @@ bool longPressExecuted = false;
 
 // for Daylight Saving Time
 bool dstEnabled = false;
+// Default to 24-hour mode
+bool use12HourMode = false;
 
 // Tells the loop whether to update the portal
 bool wifiManagerActive = false;
@@ -45,11 +57,19 @@ void setup() {
     return;
   }
 
-  // 1. Load User Preferences (DST and Dimmer)
+  // 1. Load User Preferences (DST, 12/24hr and Dimmer)
   if (LittleFS.exists("/dst.txt")) {
     File f = LittleFS.open("/dst.txt", "r");
     if (f) {
       dstEnabled = (f.readString() == "1");
+      f.close();
+    }
+  }
+
+  if (LittleFS.exists("/12hr.txt")) {
+    File f = LittleFS.open("/12hr.txt", "r");
+    if (f) {
+      use12HourMode = (f.readString() == "1");
       f.close();
     }
   }
@@ -64,6 +84,17 @@ void setup() {
     }
   }
   vfd.setBrightness(dimValues[currentDimLevel - 1]);
+
+  if (LittleFS.exists("/anim.txt")) {
+    File f = LittleFS.open("/anim.txt", "r");
+    if (f) {
+      currentAnimStyle = f.readString().toInt();
+      if (currentAnimStyle > 1)
+        currentAnimStyle = 0;
+      f.close();
+    }
+  }
+  vfd.setAnimStyle(currentAnimStyle);
 
   // 2. Let the Library handle the Fast Connect
   vfd.print("WIFI... ");
@@ -139,8 +170,7 @@ void loop() {
   static bool isStealthSyncing = false;
   static unsigned long syncStartTime = 0;
   static unsigned long connectedTime = 0;
-  static int lastSyncDay =
-      -1; // Prevents it from syncing multiple times in the same minute
+  static int lastSyncDay = -1; // Prevents syncing multiple times
 
   // --- Button Reading Logic ---
   bool currentReading = (digitalRead(BUTTON_PIN) == LOW);
@@ -160,12 +190,13 @@ void loop() {
       if (pressDuration >= 800 && !longPressExecuted) {
         longPressExecuted = true; // Lock it so it only fires once
 
-        // --- NEW: LONG PRESS ENTERS MENU ---
+        // --- LONG PRESS ENTERS MENU ---
         if (currentState == MODE_CLOCK || currentState == MODE_DATE) {
           currentState = MODE_MENU;
           currentMenu = MENU_EXIT;
           vfd.print("MENU:EXT");
-        } else if (currentState == MODE_MENU) {
+        } 
+        else if (currentState == MODE_MENU) {
           if (currentMenu == MENU_EXIT) {
             currentState = MODE_CLOCK;
             vfd.print("EXITING ");
@@ -176,27 +207,44 @@ void loop() {
           } else if (currentMenu == MENU_TOGGLE_DST) {
             dstEnabled = !dstEnabled;
             File f = LittleFS.open("/dst.txt", "w");
-            if (f) {
-              f.print(dstEnabled ? "1" : "0");
-              f.close();
-            }
+            if (f) { f.print(dstEnabled ? "1" : "0"); f.close(); }
             vfd.print("SAVED   ");
             delay(1000);
             currentState = MODE_CLOCK;
             vfd.initFramebuffer();
+          } else if (currentMenu == MENU_TOGGLE_12_24) {
+            use12HourMode = !use12HourMode;
+            File f = LittleFS.open("/12hr.txt", "w");
+            if (f) { f.print(use12HourMode ? "1" : "0"); f.close(); }
+            vfd.print("SAVED   ");
+            delay(1000);
+            currentState = MODE_CLOCK;
+            vfd.initFramebuffer();
+            // Force a time refresh so the animation instantly catches the new format!
+          } else if (currentMenu == MENU_ANIM) {
+            currentState = MODE_ANIM;
+            vfd.print(currentAnimStyle == 0 ? "FX: DROP" : "FX: FADE");
           } else if (currentMenu == MENU_DIMMER) {
             currentState = MODE_DIMMER;
             char lvlStr[9];
             snprintf(lvlStr, sizeof(lvlStr), "LEVEL: %d", currentDimLevel);
             vfd.print(lvlStr);
           }
-        } else if (currentState == MODE_DIMMER) {
-          // Save Dimmer and Exit
+        }
+        // --- SAVE AND EXIT ANIMATION SUB-MENU ---
+        else if (currentState == MODE_ANIM) {
+          File f = LittleFS.open("/anim.txt", "w");
+          if (f) { f.print(currentAnimStyle); f.close(); }
+          vfd.setAnimStyle(currentAnimStyle);
+          vfd.print("SAVED   ");
+          delay(1000);
+          currentState = MODE_CLOCK;
+          vfd.initFramebuffer();
+        } 
+        // --- SAVE AND EXIT DIMMER SUB-MENU ---
+        else if (currentState == MODE_DIMMER) {
           File f = LittleFS.open("/dim.txt", "w");
-          if (f) {
-            f.print(currentDimLevel);
-            f.close();
-          }
+          if (f) { f.print(currentDimLevel); f.close(); }
           vfd.print("SAVED   ");
           delay(1000);
           currentState = MODE_CLOCK;
@@ -213,17 +261,24 @@ void loop() {
     // --- SHORT PRESS ACTION (Only fires if we didn't just do a long press) ---
     if (pressDuration > 50 && !longPressExecuted) {
 
-      // --- NEW: SHORT PRESS TRIGGERS DATE PEEK ---
+      // --- SHORT PRESS TRIGGERS DATE PEEK ---
       if (currentState == MODE_CLOCK) {
         currentState = MODE_DATE;
       } else if (currentState == MODE_DATE) {
         currentState = MODE_CLOCK; // Tap again to manually dismiss early
-      } else if (currentState == MODE_MENU) {
-        // Cycle Menu
+      }
+      // --- CYCLE MAIN MENU ---
+      else if (currentState == MODE_MENU) {
         if (currentMenu == MENU_EXIT) {
           currentMenu = MENU_TOGGLE_DST;
           vfd.print(dstEnabled ? "DST->OFF" : "DST->ON ");
         } else if (currentMenu == MENU_TOGGLE_DST) {
+          currentMenu = MENU_TOGGLE_12_24;
+          vfd.print(use12HourMode ? "12H->24H" : "24H->12H");
+        } else if (currentMenu == MENU_TOGGLE_12_24) {
+          currentMenu = MENU_ANIM;
+          vfd.print("ANIM FX ");
+        } else if (currentMenu == MENU_ANIM) {
           currentMenu = MENU_DIMMER;
           vfd.print("DIMMER  ");
         } else if (currentMenu == MENU_DIMMER) {
@@ -233,20 +288,27 @@ void loop() {
           currentMenu = MENU_EXIT;
           vfd.print("MENU:EXT");
         }
-      } else if (currentState == MODE_DIMMER) {
-        // Cycle Brightness
+      }
+      // --- CYCLE ANIMATION STYLES (Inside Sub-Menu) ---
+      else if (currentState == MODE_ANIM) {
+        currentAnimStyle = (currentAnimStyle == 0) ? 1 : 0; // Flip
+        vfd.print(currentAnimStyle == 0 ? "FX: DROP" : "FX: FADE");
+      }
+      // --- CYCLE BRIGHTNESS LEVELS (Inside Sub-Menu) ---
+      else if (currentState == MODE_DIMMER) {
         currentDimLevel++;
-        if (currentDimLevel > 8)
-          currentDimLevel = 1;
+        if (currentDimLevel > 8) currentDimLevel = 1;
+
         vfd.setBrightness(dimValues[currentDimLevel - 1]);
+
         char lvlStr[9];
         snprintf(lvlStr, sizeof(lvlStr), "LEVEL: %d", currentDimLevel);
         vfd.print(lvlStr);
       }
     }
-  }
+  } // End of Button went up
 
-// --- Clock & Date Display Logic ---
+  // --- Clock & Date Display Logic ---
   if (currentState == MODE_CLOCK || currentState == MODE_DATE) {
     static int lastSecond = -1;
     static unsigned long dateShowTime = 0;
@@ -259,7 +321,8 @@ void loop() {
       struct tm *timeInfo = localtime(&displayTime);
 
       // --- 2 AM STEALTH SYNC ENGINE ---
-      if (timeInfo->tm_hour == 2 && timeInfo->tm_min == 0 && timeInfo->tm_sec == 0 && lastSyncDay != timeInfo->tm_yday) {
+      if (timeInfo->tm_hour == 2 && timeInfo->tm_min == 0 &&
+          timeInfo->tm_sec == 0 && lastSyncDay != timeInfo->tm_yday) {
         isStealthSyncing = true;
         lastSyncDay = timeInfo->tm_yday;
         syncStartTime = millis();
@@ -274,7 +337,8 @@ void loop() {
           isStealthSyncing = false;
           WiFi.disconnect();
           WiFi.mode(WIFI_OFF);
-          pinMode(2, OUTPUT); digitalWrite(2, HIGH);
+          pinMode(2, OUTPUT);
+          digitalWrite(2, HIGH);
         } else if (WiFi.status() == WL_CONNECTED) {
           if (connectedTime == 0) {
             connectedTime = millis();
@@ -284,7 +348,8 @@ void loop() {
             isStealthSyncing = false;
             WiFi.disconnect();
             WiFi.mode(WIFI_OFF);
-            pinMode(2, OUTPUT); digitalWrite(2, HIGH);
+            pinMode(2, OUTPUT);
+            digitalWrite(2, HIGH);
           }
         }
       }
@@ -297,34 +362,48 @@ void loop() {
         if (!dateInitialized) {
           dateInitialized = true;
           dateShowTime = millis();
-          
-          // Using the new dash formatting!
+
           strftime(targetText, sizeof(targetText), "%d-%m-%y", timeInfo);
-          vfd.animateTo(targetText, false); // Slide down
+          vfd.animateTo(targetText, false);
         }
 
-        // Revert to Clock Mode after 3 seconds
         if (millis() - dateShowTime > 3000) {
           currentState = MODE_CLOCK;
           dateInitialized = false;
-          
-          strftime(targetText, sizeof(targetText), "%H:%M:%S", timeInfo);
-          vfd.animateTo(targetText, true); // Slide up!
+
+          // Format based on 12/24 preference
+          if (use12HourMode) {
+            strftime(targetText, sizeof(targetText), "%I:%M:%S", timeInfo);
+            if (targetText[0] == '0')
+              targetText[0] = ' '; // Clean leading zero
+          } else {
+            strftime(targetText, sizeof(targetText), "%H:%M:%S", timeInfo);
+          }
+
+          vfd.animateTo(targetText, true);
         }
       }
       // --- CLOCK MODE LOGIC ---
       else {
         if (timeInfo->tm_sec != lastSecond) {
-          if (lastSecond == -1) vfd.initFramebuffer(); 
+          if (lastSecond == -1) vfd.initFramebuffer();
           lastSecond = timeInfo->tm_sec;
 
-          strftime(targetText, sizeof(targetText), "%H:%M:%S", timeInfo);
-          vfd.animateTo(targetText, false); // Normal second tick slides down
+          // Format based on 12/24 preference
+          if (use12HourMode) {
+            strftime(targetText, sizeof(targetText), "%I:%M:%S", timeInfo);
+            if (targetText[0] == '0')
+              targetText[0] = ' '; // Clean leading zero
+          } else {
+            strftime(targetText, sizeof(targetText), "%H:%M:%S", timeInfo);
+          }
+
+          vfd.animateTo(targetText, false);
         }
       }
-    }
 
-    // Tell the VFD driver to process any pending animation frames
-    vfd.updateAnimation();
+      // Tell the VFD driver to process any pending animation frames
+      vfd.updateAnimation();
+    }
   }
 } // End of loop()
