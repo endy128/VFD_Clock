@@ -19,7 +19,9 @@ Before flashing custom code, it is **highly recommended** to back up the factory
 Use `esptool.py` to read the flash (assuming a 4MB flash size):
 ```bash
 # Identify your port first (e.g., COM3 or /dev/ttyUSB0)
-esptool.py --port /dev/ttyUSB0 read_flash 0 0x400000 backup_firmware.bin
+esptool.py --port /dev/ttyUSB0 --baud 460800 read_flash 0 0x400000 backup_firmware.bin
+# To write it back
+# esptool.py --port /dev/ttyUSB0 --baud 460800 write_flash 0 backup_firmware.bin
 ```
 
 
@@ -90,4 +92,10 @@ If the clock boots to `SET WIFI`, connect to the VFD-Clock access point on your 
 
 - SSID: `VFD-Clock`
 - Pass: `12345678`
+
+
+## Acknowledgements
+
+- [sfxfs/FUTABA-VFD-8-MD-06INKM](https://github.com/sfxfs/FUTABA-VFD-8-MD-06INKM)
+
 
