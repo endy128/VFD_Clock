@@ -63,7 +63,8 @@ Unlike the factory firmware, we utilize the VFD's 8 CGRAM slots as a hardware fr
 2. "Stealth Sync" Technology
 To solve the common problem of ESP8266 heat affecting the clock's accuracy:
 - **Radio Silence**: WiFi connects on boot to get NTP time, then **powers off completely**.
-- **Daily Maintenance**: At 2:00 AM, the radio silently wakes up, re-syncs with an atomic clock, and shuts down again.
+- **Daily Maintenance**: Once during the 2 AM hour, the radio silently wakes up, re-syncs with an atomic clock, and shuts down again (the clock keeps running during the sync).
+- **Power-Cut Recovery**: If WiFi isn't available at boot (e.g. the router is still starting up after a power cut), the clock retries every 60 seconds until it gets the time, with no need to power cycle it.
 - **Heat Reduction**: Keeping the RF radio off 99% of the time keeps the VFD driver and ESP chip cool, extending hardware life.
 
 3. Integrated UI & Menu System
@@ -80,13 +81,31 @@ Accessed via a single button (Short press for Date, Long press for Menu):
 
 2. Ensure you have the following libraries (auto-managed by `platformio.ini`):
 - `AyresWiFiManager`
-- `LittleFS`
+- `ArduinoJson`
 
 3. Connect your clock via USB, hold the Flash button (GPIO 0), and click Upload.
 
 ### Note
 
 If the clock boots to `SET WIFI`, connect to the VFD-Clock access point on your phone to enter your local network credentials. The clock will remember these and skip the portal on the next boot!
+
+### Startup Messages
+
+Until the clock has the time, it shows its WiFi status:
+
+|Display   |Meaning|
+|----------|-------|
+|`WIFI...` |Connecting to your WiFi network|
+|`SYNCING` |Connected, waiting for the time from the internet|
+|`RETRY 1`, `RETRY 2`|The last attempt failed; trying again in 60 seconds|
+|`NO WIFI` |3 attempts have failed. The clock keeps retrying every 60 seconds in the background and shows the time as soon as it succeeds|
+|`SET WIFI`|No WiFi details saved; the setup portal is open (see below)|
+
+While one of these messages is showing, a **short press** of the button starts a new attempt straight away.
+
+If no WiFi details are saved, the setup portal closes after 5 minutes with no activity and the clock shows `NO WIFI`. Power cycle the clock to open the portal again.
+
+The retry timings are constants at the top of `src/main.cpp` (`RETRY_INTERVAL_MS`, `FAILS_BEFORE_ERROR`, etc.).
 
 ### WiFi Portal Credentials
 

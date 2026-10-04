@@ -1,7 +1,9 @@
 #include <Arduino.h>
+#include <ArduinoJson.h>
 #include <AyresWiFiManager.h>
 #include <LittleFS.h>
 #include <VFD_Driver.h>
+#include <coredecls.h> // settimeofday_cb()
 #include <time.h>
 
 // GPIO mapping
@@ -9,15 +11,28 @@
 #define CLK_PIN 12
 #define DATA_PIN 14
 #define BUTTON_PIN 0
+#define LED_PIN 2 // ESP-12F blue LED (active-low)
+
+// Button timing (ms)
+const unsigned long DEBOUNCE_MS = 50;
+const unsigned long LONG_PRESS_MS = 800;
+const unsigned long DATE_SHOW_MS = 3000;
+
+// Time sync timing
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
+const unsigned long NTP_TIMEOUT_MS = 10000;
+const unsigned long RETRY_INTERVAL_MS = 60000; // Wait between failed attempts
+const uint8_t FAILS_BEFORE_ERROR = 3;          // Show "NO WIFI" after this many
+const int DAILY_SYNC_HOUR = 2;
 
 VFD_Driver vfd(CS_PIN, CLK_PIN, DATA_PIN);
 AyresWiFiManager wm;
 
-// --- Animation Style Globals ---
-uint8_t currentAnimStyle = 0; // 0 = Drop, 1 = Fade
-
-// --- Dimmer Globals ---
-uint8_t currentDimLevel = 4; // Default to Level 4 (120)
+// --- User settings (persisted in LittleFS) ---
+bool dstEnabled = false;
+bool use12HourMode = false;
+uint8_t animStyle = 0; // 0 = Drop, 1 = Fade
+uint8_t dimLevel = 4;  // 1..8, index into dimValues
 const uint8_t dimValues[8] = {30, 60, 90, 120, 150, 180, 210, 240};
 
 // --- Menu State Machine ---
@@ -30,23 +45,343 @@ enum MenuOption {
   MENU_TOGGLE_12_24,
   MENU_ANIM,
   MENU_DIMMER,
-  MENU_RESET_WIFI
+  MENU_RESET_WIFI,
+  MENU_COUNT
 };
 MenuOption currentMenu = MENU_EXIT;
 
-// --- Button tracking ---
-unsigned long buttonPressTime = 0;
-bool buttonIsPressed = false;
-// Tracks if we already fired the long press
-bool longPressExecuted = false;
+bool redrawClock = true;          // Set when returning from a text screen
+unsigned long dateShownAt = 0;
 
-// for Daylight Saving Time
-bool dstEnabled = false;
-// Default to 24-hour mode
-bool use12HourMode = false;
+// --- Time sync state ---
+enum SyncState { SYNC_IDLE, SYNC_CONNECTING, SYNC_WAITING_NTP };
+SyncState syncState = SYNC_IDLE;
+unsigned long syncStepStart = 0;
+unsigned long lastSyncEnd = 0;
+uint8_t syncFailures = 0;
+volatile bool ntpReceived = false; // Set by the SNTP callback
+String wifiSsid, wifiPass;
 
-// Tells the loop whether to update the portal
-bool wifiManagerActive = false;
+// ============================================================
+//  Settings
+// ============================================================
+
+int loadSetting(const char *path, int fallback) {
+  File f = LittleFS.open(path, "r");
+  if (!f) return fallback;
+  int value = f.readString().toInt();
+  f.close();
+  return value;
+}
+
+void saveSetting(const char *path, int value) {
+  File f = LittleFS.open(path, "w");
+  if (f) {
+    f.print(value);
+    f.close();
+  }
+}
+
+// The WiFi manager keeps its credentials private, so read them ourselves
+// for the background sync.
+void loadWifiCredentials() {
+  File f = LittleFS.open("/wifi.json", "r");
+  if (!f) return;
+  JsonDocument doc;
+  if (!deserializeJson(doc, f)) {
+    wifiSsid = doc["ssid"].as<String>();
+    wifiPass = doc["password"].as<String>();
+  }
+  f.close();
+}
+
+bool hasWifiCredentials() { return wifiSsid.length() > 0; }
+
+// ============================================================
+//  Time helpers
+// ============================================================
+
+bool timeIsValid() { return time(nullptr) > 100000; }
+
+// Local time with the DST offset applied
+struct tm localNow() {
+  time_t t = time(nullptr) + (dstEnabled ? 3600 : 0);
+  return *localtime(&t);
+}
+
+void formatTime(char *buf, const struct tm &t) {
+  if (use12HourMode) {
+    strftime(buf, 9, "%I:%M:%S", &t);
+    if (buf[0] == '0') buf[0] = ' '; // Clean leading zero
+  } else {
+    strftime(buf, 9, "%H:%M:%S", &t);
+  }
+}
+
+// ============================================================
+//  WiFi / NTP sync (non-blocking)
+//
+//  The radio is only on while syncing. If the time has never been set
+//  (e.g. the router is still booting after a power cut) we keep retrying
+//  every RETRY_INTERVAL_MS until it works.
+// ============================================================
+
+void startSync() {
+  syncState = SYNC_CONNECTING;
+  syncStepStart = millis();
+  ntpReceived = false;
+  digitalWrite(LED_PIN, LOW);
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+  }
+}
+
+void finishSync(bool success) {
+  // Kill the RF hardware to save heat
+  WiFi.disconnect();
+  WiFi.mode(WIFI_OFF);
+  digitalWrite(LED_PIN, HIGH);
+  syncState = SYNC_IDLE;
+  lastSyncEnd = millis();
+  syncFailures = success ? 0 : syncFailures + 1;
+}
+
+void updateSync() {
+  unsigned long elapsed = millis() - syncStepStart;
+
+  switch (syncState) {
+  case SYNC_IDLE:
+    if (!hasWifiCredentials() || wm.isPortalActive()) return;
+    if (!timeIsValid()) {
+      if (millis() - lastSyncEnd > RETRY_INTERVAL_MS) startSync();
+    } else {
+      static int lastSyncDay = -1;
+      struct tm now = localNow();
+      if (now.tm_hour == DAILY_SYNC_HOUR && now.tm_yday != lastSyncDay) {
+        lastSyncDay = now.tm_yday;
+        startSync();
+      }
+    }
+    break;
+
+  case SYNC_CONNECTING:
+    if (WiFi.status() == WL_CONNECTED) {
+      configTime(0, 0, "pool.ntp.org");
+      syncState = SYNC_WAITING_NTP;
+      syncStepStart = millis();
+    } else if (elapsed > WIFI_CONNECT_TIMEOUT_MS) {
+      finishSync(false);
+    }
+    break;
+
+  case SYNC_WAITING_NTP:
+    if (ntpReceived) finishSync(true);
+    else if (elapsed > NTP_TIMEOUT_MS) finishSync(false);
+    break;
+  }
+}
+
+// ============================================================
+//  Menu / UI
+// ============================================================
+
+void showMessage(const char *msg) {
+  vfd.print(msg);
+  delay(1000);
+}
+
+void returnToClock() {
+  currentState = MODE_CLOCK;
+  redrawClock = true;
+}
+
+void saveAndExit(const char *path, int value) {
+  saveSetting(path, value);
+  showMessage("SAVED   ");
+  returnToClock();
+}
+
+void showMenuItem() {
+  switch (currentMenu) {
+  case MENU_EXIT:         vfd.print("MENU:EXT"); break;
+  case MENU_TOGGLE_DST:   vfd.print(dstEnabled ? "DST->OFF" : "DST->ON "); break;
+  case MENU_TOGGLE_12_24: vfd.print(use12HourMode ? "12H->24H" : "24H->12H"); break;
+  case MENU_ANIM:         vfd.print("ANIM FX "); break;
+  case MENU_DIMMER:       vfd.print("DIMMER  "); break;
+  case MENU_RESET_WIFI:   vfd.print("RST WIFI"); break;
+  default: break;
+  }
+}
+
+void showAnimStyle() { vfd.print(animStyle == 0 ? "FX: DROP" : "FX: FADE"); }
+
+void showDimLevel() {
+  char buf[9];
+  snprintf(buf, sizeof(buf), "LEVEL: %c", '0' + dimLevel);
+  vfd.print(buf);
+}
+
+void resetWiFiAndReboot() {
+  vfd.print("ERASING ");
+  wm.eraseCredentials();
+  delay(2000); // Give the user time to read the screen
+  showMessage("REBOOT  ");
+  ESP.restart();
+}
+
+void selectMenuItem() {
+  switch (currentMenu) {
+  case MENU_EXIT:
+    showMessage("EXITING ");
+    returnToClock();
+    break;
+  case MENU_TOGGLE_DST:
+    dstEnabled = !dstEnabled;
+    saveAndExit("/dst.txt", dstEnabled);
+    break;
+  case MENU_TOGGLE_12_24:
+    use12HourMode = !use12HourMode;
+    saveAndExit("/12hr.txt", use12HourMode);
+    break;
+  case MENU_ANIM:
+    currentState = MODE_ANIM;
+    showAnimStyle();
+    break;
+  case MENU_DIMMER:
+    currentState = MODE_DIMMER;
+    showDimLevel();
+    break;
+  case MENU_RESET_WIFI:
+    resetWiFiAndReboot();
+    break;
+  default: break;
+  }
+}
+
+void onLongPress() {
+  switch (currentState) {
+  case MODE_CLOCK:
+  case MODE_DATE:
+    currentState = MODE_MENU;
+    currentMenu = MENU_EXIT;
+    showMenuItem();
+    break;
+  case MODE_MENU:
+    selectMenuItem();
+    break;
+  case MODE_ANIM:
+    vfd.setAnimStyle(animStyle);
+    saveAndExit("/anim.txt", animStyle);
+    break;
+  case MODE_DIMMER:
+    saveAndExit("/dim.txt", dimLevel);
+    break;
+  }
+}
+
+void onShortPress() {
+  switch (currentState) {
+  case MODE_CLOCK:
+    if (timeIsValid()) {
+      currentState = MODE_DATE; // Date peek
+      dateShownAt = millis();
+    } else if (syncState == SYNC_IDLE && hasWifiCredentials() && !wm.isPortalActive()) {
+      syncFailures = 0; // No time yet: tap to retry WiFi now
+      startSync();
+    }
+    break;
+  case MODE_DATE:
+    currentState = MODE_CLOCK; // Tap again to dismiss early
+    break;
+  case MODE_MENU:
+    currentMenu = MenuOption((currentMenu + 1) % MENU_COUNT);
+    showMenuItem();
+    break;
+  case MODE_ANIM:
+    animStyle = !animStyle;
+    showAnimStyle();
+    break;
+  case MODE_DIMMER:
+    dimLevel = dimLevel % 8 + 1; // 1..8, wrapping
+    vfd.setBrightness(dimValues[dimLevel - 1]);
+    showDimLevel();
+    break;
+  }
+}
+
+void readButton() {
+  static bool isPressed = false;
+  static bool longPressFired = false;
+  static unsigned long pressStart = 0;
+
+  bool down = (digitalRead(BUTTON_PIN) == LOW);
+  unsigned long held = millis() - pressStart;
+
+  if (down && !isPressed) {
+    isPressed = true;
+    longPressFired = false;
+    pressStart = millis();
+  } else if (down && held >= LONG_PRESS_MS && !longPressFired) {
+    longPressFired = true; // Fires once, while still holding
+    onLongPress();
+  } else if (!down && isPressed) {
+    isPressed = false;
+    if (held > DEBOUNCE_MS && !longPressFired) onShortPress();
+  }
+}
+
+// ============================================================
+//  Display
+// ============================================================
+
+// Shown in place of the clock until the time has been set
+const char *statusText() {
+  static char buf[9];
+  if (wm.isPortalActive()) return "SET WIFI";
+  if (!hasWifiCredentials() || syncFailures >= FAILS_BEFORE_ERROR) return "NO WIFI ";
+  if (syncState == SYNC_WAITING_NTP) return "SYNCING ";
+  if (syncFailures == 0) return "WIFI... ";
+  snprintf(buf, sizeof(buf), "RETRY %c", '0' + syncFailures);
+  return buf;
+}
+
+void updateDisplay() {
+  if (currentState != MODE_CLOCK && currentState != MODE_DATE) return;
+
+  if (!timeIsValid()) {
+    static char shown[9] = "";
+    const char *msg = statusText();
+    if (redrawClock || strcmp(msg, shown) != 0) {
+      strlcpy(shown, msg, sizeof(shown));
+      vfd.print(msg);
+      redrawClock = true; // Re-attach the framebuffer once the time arrives
+    }
+    return;
+  }
+
+  if (redrawClock) {
+    vfd.initFramebuffer();
+    redrawClock = false;
+  }
+
+  struct tm now = localNow();
+  char text[9];
+  bool slideUp = false;
+
+  if (currentState == MODE_DATE && millis() - dateShownAt > DATE_SHOW_MS) {
+    currentState = MODE_CLOCK;
+    slideUp = true; // Date slides up back to the time
+  }
+
+  if (currentState == MODE_DATE) strftime(text, sizeof(text), "%d-%m-%y", &now);
+  else formatTime(text, now);
+
+  vfd.animateTo(text, slideUp); // No-op if unchanged or mid-animation
+  vfd.updateAnimation();
+}
+
+// ============================================================
 
 void setup() {
   vfd.begin();
@@ -57,46 +392,18 @@ void setup() {
     return;
   }
 
-  // 1. Load User Preferences (DST, 12/24hr and Dimmer)
-  if (LittleFS.exists("/dst.txt")) {
-    File f = LittleFS.open("/dst.txt", "r");
-    if (f) {
-      dstEnabled = (f.readString() == "1");
-      f.close();
-    }
-  }
+  // 1. Load User Preferences
+  dstEnabled = loadSetting("/dst.txt", 0) == 1;
+  use12HourMode = loadSetting("/12hr.txt", 0) == 1;
+  dimLevel = loadSetting("/dim.txt", 4);
+  if (dimLevel < 1 || dimLevel > 8) dimLevel = 4;
+  animStyle = loadSetting("/anim.txt", 0);
+  if (animStyle > 1) animStyle = 0;
 
-  if (LittleFS.exists("/12hr.txt")) {
-    File f = LittleFS.open("/12hr.txt", "r");
-    if (f) {
-      use12HourMode = (f.readString() == "1");
-      f.close();
-    }
-  }
+  vfd.setBrightness(dimValues[dimLevel - 1]);
+  vfd.setAnimStyle(animStyle);
 
-  if (LittleFS.exists("/dim.txt")) {
-    File f = LittleFS.open("/dim.txt", "r");
-    if (f) {
-      currentDimLevel = f.readString().toInt();
-      if (currentDimLevel < 1 || currentDimLevel > 8)
-        currentDimLevel = 4;
-      f.close();
-    }
-  }
-  vfd.setBrightness(dimValues[currentDimLevel - 1]);
-
-  if (LittleFS.exists("/anim.txt")) {
-    File f = LittleFS.open("/anim.txt", "r");
-    if (f) {
-      currentAnimStyle = f.readString().toInt();
-      if (currentAnimStyle > 1)
-        currentAnimStyle = 0;
-      f.close();
-    }
-  }
-  vfd.setAnimStyle(currentAnimStyle);
-
-  // 2. Let the Library handle the Fast Connect
+  // 2. WiFi manager: opens the setup portal if there are no credentials
   vfd.print("WIFI... ");
 
   wm.setHostname("VFDClock");
@@ -104,306 +411,22 @@ void setup() {
   wm.setPortalTimeout(300);
   wm.setAPClientCheck(true);
   wm.setWebClientCheck(true);
-
   wm.begin();
-  wm.run(); // This will auto-connect instantly if it has the JSON keys!
+  wm.run();
 
-  // 3. The "Stealth" Takeover
-  if (WiFi.status() == WL_CONNECTED) {
-    vfd.print("SYNCING ");
-    configTime(0, 0, "pool.ntp.org");
-
-    // Wait for the atomic time to arrive
-    int retries = 0;
-    time_t now = time(nullptr);
-    while (now < 100000 && retries < 20) {
-      delay(500);
-      now = time(nullptr);
-      retries++;
-    }
-
-    if (now > 100000) {
-      vfd.print("RADIOOFF");
-      delay(1000);
-
-      // We have the time. Kill the RF hardware to save heat!
-      WiFi.disconnect();
-      WiFi.mode(WIFI_OFF);
-      wifiManagerActive = false; // Tell the loop to ignore wm.update()
-      // Manually turn off the ESP-12F Blue LED (Active-Low)
-      pinMode(2, OUTPUT);
-      digitalWrite(2, HIGH);
-    } else {
-      // Failed to get NTP time, keep manager alive just in case
-      wifiManagerActive = true;
-    }
-  } else {
-    // No credentials or bad password. Portal is running.
-    vfd.print("SET WIFI");
-    wifiManagerActive = true;
-  }
-
-  // Switch to animation mode
-  vfd.initFramebuffer();
-}
-
-// Helper function to wipe the credentials
-void resetWiFiAndReboot() {
-  vfd.print("ERASING ");
-
-  // Use the WiFi manager to delete the credentials
-  wm.eraseCredentials();
-
-  delay(2000); // Give the user time to read the screen
-  vfd.print("REBOOT  ");
-  delay(1000);
-  ESP.restart(); // Hard reboot the ESP8266
+  // 3. Fetch NTP time, then turn the radio off. If WiFi isn't up yet,
+  // updateSync() keeps retrying from loop().
+  pinMode(LED_PIN, OUTPUT);
+  settimeofday_cb([](bool fromSntp) {
+    if (fromSntp) ntpReceived = true;
+  });
+  loadWifiCredentials();
+  if (hasWifiCredentials() && !wm.isPortalActive()) startSync();
 }
 
 void loop() {
-  // Only update the portal if the Fast Boot failed
-  if (wifiManagerActive) {
-    wm.update();
-  }
-
-  // --- STEALTH SYNC VARIABLES ---
-  static bool isStealthSyncing = false;
-  static unsigned long syncStartTime = 0;
-  static unsigned long connectedTime = 0;
-  static int lastSyncDay = -1; // Prevents syncing multiple times
-
-  // --- Button Reading Logic ---
-  bool currentReading = (digitalRead(BUTTON_PIN) == LOW);
-
-  if (currentReading) {
-    // 1. Button just went down
-    if (!buttonIsPressed) {
-      buttonPressTime = millis();
-      buttonIsPressed = true;
-      longPressExecuted = false; // Reset the flag for this new press
-    }
-    // 2. Button is being held down
-    else {
-      unsigned long pressDuration = millis() - buttonPressTime;
-
-      // --- LONG PRESS ACTION (Triggers immediately while holding) ---
-      if (pressDuration >= 800 && !longPressExecuted) {
-        longPressExecuted = true; // Lock it so it only fires once
-
-        // --- LONG PRESS ENTERS MENU ---
-        if (currentState == MODE_CLOCK || currentState == MODE_DATE) {
-          currentState = MODE_MENU;
-          currentMenu = MENU_EXIT;
-          vfd.print("MENU:EXT");
-        } 
-        else if (currentState == MODE_MENU) {
-          if (currentMenu == MENU_EXIT) {
-            currentState = MODE_CLOCK;
-            vfd.print("EXITING ");
-            delay(1000);
-            vfd.initFramebuffer();
-          } else if (currentMenu == MENU_RESET_WIFI) {
-            resetWiFiAndReboot();
-          } else if (currentMenu == MENU_TOGGLE_DST) {
-            dstEnabled = !dstEnabled;
-            File f = LittleFS.open("/dst.txt", "w");
-            if (f) { f.print(dstEnabled ? "1" : "0"); f.close(); }
-            vfd.print("SAVED   ");
-            delay(1000);
-            currentState = MODE_CLOCK;
-            vfd.initFramebuffer();
-          } else if (currentMenu == MENU_TOGGLE_12_24) {
-            use12HourMode = !use12HourMode;
-            File f = LittleFS.open("/12hr.txt", "w");
-            if (f) { f.print(use12HourMode ? "1" : "0"); f.close(); }
-            vfd.print("SAVED   ");
-            delay(1000);
-            currentState = MODE_CLOCK;
-            vfd.initFramebuffer();
-            // Force a time refresh so the animation instantly catches the new format!
-          } else if (currentMenu == MENU_ANIM) {
-            currentState = MODE_ANIM;
-            vfd.print(currentAnimStyle == 0 ? "FX: DROP" : "FX: FADE");
-          } else if (currentMenu == MENU_DIMMER) {
-            currentState = MODE_DIMMER;
-            char lvlStr[9];
-            snprintf(lvlStr, sizeof(lvlStr), "LEVEL: %d", currentDimLevel);
-            vfd.print(lvlStr);
-          }
-        }
-        // --- SAVE AND EXIT ANIMATION SUB-MENU ---
-        else if (currentState == MODE_ANIM) {
-          File f = LittleFS.open("/anim.txt", "w");
-          if (f) { f.print(currentAnimStyle); f.close(); }
-          vfd.setAnimStyle(currentAnimStyle);
-          vfd.print("SAVED   ");
-          delay(1000);
-          currentState = MODE_CLOCK;
-          vfd.initFramebuffer();
-        } 
-        // --- SAVE AND EXIT DIMMER SUB-MENU ---
-        else if (currentState == MODE_DIMMER) {
-          File f = LittleFS.open("/dim.txt", "w");
-          if (f) { f.print(currentDimLevel); f.close(); }
-          vfd.print("SAVED   ");
-          delay(1000);
-          currentState = MODE_CLOCK;
-          vfd.initFramebuffer();
-        }
-      }
-    }
-  }
-  // 3. Button just went up
-  else if (!currentReading && buttonIsPressed) {
-    unsigned long pressDuration = millis() - buttonPressTime;
-    buttonIsPressed = false;
-
-    // --- SHORT PRESS ACTION (Only fires if we didn't just do a long press) ---
-    if (pressDuration > 50 && !longPressExecuted) {
-
-      // --- SHORT PRESS TRIGGERS DATE PEEK ---
-      if (currentState == MODE_CLOCK) {
-        currentState = MODE_DATE;
-      } else if (currentState == MODE_DATE) {
-        currentState = MODE_CLOCK; // Tap again to manually dismiss early
-      }
-      // --- CYCLE MAIN MENU ---
-      else if (currentState == MODE_MENU) {
-        if (currentMenu == MENU_EXIT) {
-          currentMenu = MENU_TOGGLE_DST;
-          vfd.print(dstEnabled ? "DST->OFF" : "DST->ON ");
-        } else if (currentMenu == MENU_TOGGLE_DST) {
-          currentMenu = MENU_TOGGLE_12_24;
-          vfd.print(use12HourMode ? "12H->24H" : "24H->12H");
-        } else if (currentMenu == MENU_TOGGLE_12_24) {
-          currentMenu = MENU_ANIM;
-          vfd.print("ANIM FX ");
-        } else if (currentMenu == MENU_ANIM) {
-          currentMenu = MENU_DIMMER;
-          vfd.print("DIMMER  ");
-        } else if (currentMenu == MENU_DIMMER) {
-          currentMenu = MENU_RESET_WIFI;
-          vfd.print("RST WIFI");
-        } else {
-          currentMenu = MENU_EXIT;
-          vfd.print("MENU:EXT");
-        }
-      }
-      // --- CYCLE ANIMATION STYLES (Inside Sub-Menu) ---
-      else if (currentState == MODE_ANIM) {
-        currentAnimStyle = (currentAnimStyle == 0) ? 1 : 0; // Flip
-        vfd.print(currentAnimStyle == 0 ? "FX: DROP" : "FX: FADE");
-      }
-      // --- CYCLE BRIGHTNESS LEVELS (Inside Sub-Menu) ---
-      else if (currentState == MODE_DIMMER) {
-        currentDimLevel++;
-        if (currentDimLevel > 8) currentDimLevel = 1;
-
-        vfd.setBrightness(dimValues[currentDimLevel - 1]);
-
-        char lvlStr[9];
-        snprintf(lvlStr, sizeof(lvlStr), "LEVEL: %d", currentDimLevel);
-        vfd.print(lvlStr);
-      }
-    }
-  } // End of Button went up
-
-  // --- Clock & Date Display Logic ---
-  if (currentState == MODE_CLOCK || currentState == MODE_DATE) {
-    static int lastSecond = -1;
-    static unsigned long dateShowTime = 0;
-    static bool dateInitialized = false;
-
-    time_t raw_now = time(nullptr);
-
-    if (raw_now > 100000) {
-      time_t displayTime = raw_now + (dstEnabled ? 3600 : 0);
-      struct tm *timeInfo = localtime(&displayTime);
-
-      // --- 2 AM STEALTH SYNC ENGINE ---
-      if (timeInfo->tm_hour == 2 && timeInfo->tm_min == 0 &&
-          timeInfo->tm_sec == 0 && lastSyncDay != timeInfo->tm_yday) {
-        isStealthSyncing = true;
-        lastSyncDay = timeInfo->tm_yday;
-        syncStartTime = millis();
-        connectedTime = 0;
-        WiFi.mode(WIFI_STA);
-        WiFi.begin();
-        digitalWrite(2, LOW);
-      }
-
-      if (isStealthSyncing) {
-        if (millis() - syncStartTime > 15000) {
-          isStealthSyncing = false;
-          WiFi.disconnect();
-          WiFi.mode(WIFI_OFF);
-          pinMode(2, OUTPUT);
-          digitalWrite(2, HIGH);
-        } else if (WiFi.status() == WL_CONNECTED) {
-          if (connectedTime == 0) {
-            connectedTime = millis();
-            configTime(0, 0, "pool.ntp.org");
-          }
-          if (millis() - connectedTime > 5000) {
-            isStealthSyncing = false;
-            WiFi.disconnect();
-            WiFi.mode(WIFI_OFF);
-            pinMode(2, OUTPUT);
-            digitalWrite(2, HIGH);
-          }
-        }
-      }
-      // --------------------------------
-
-      char targetText[9] = "        ";
-
-      // --- DATE MODE LOGIC ---
-      if (currentState == MODE_DATE) {
-        if (!dateInitialized) {
-          dateInitialized = true;
-          dateShowTime = millis();
-
-          strftime(targetText, sizeof(targetText), "%d-%m-%y", timeInfo);
-          vfd.animateTo(targetText, false);
-        }
-
-        if (millis() - dateShowTime > 3000) {
-          currentState = MODE_CLOCK;
-          dateInitialized = false;
-
-          // Format based on 12/24 preference
-          if (use12HourMode) {
-            strftime(targetText, sizeof(targetText), "%I:%M:%S", timeInfo);
-            if (targetText[0] == '0')
-              targetText[0] = ' '; // Clean leading zero
-          } else {
-            strftime(targetText, sizeof(targetText), "%H:%M:%S", timeInfo);
-          }
-
-          vfd.animateTo(targetText, true);
-        }
-      }
-      // --- CLOCK MODE LOGIC ---
-      else {
-        if (timeInfo->tm_sec != lastSecond) {
-          if (lastSecond == -1) vfd.initFramebuffer();
-          lastSecond = timeInfo->tm_sec;
-
-          // Format based on 12/24 preference
-          if (use12HourMode) {
-            strftime(targetText, sizeof(targetText), "%I:%M:%S", timeInfo);
-            if (targetText[0] == '0')
-              targetText[0] = ' '; // Clean leading zero
-          } else {
-            strftime(targetText, sizeof(targetText), "%H:%M:%S", timeInfo);
-          }
-
-          vfd.animateTo(targetText, false);
-        }
-      }
-
-      // Tell the VFD driver to process any pending animation frames
-      vfd.updateAnimation();
-    }
-  }
-} // End of loop()
+  if (wm.isPortalActive()) wm.update();
+  updateSync();
+  readButton();
+  updateDisplay();
+}

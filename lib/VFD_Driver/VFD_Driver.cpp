@@ -39,8 +39,9 @@ void VFD_Driver::writeCommand(uint8_t cmd, uint8_t data) {
 void VFD_Driver::print(const char* msg) {
     digitalWrite(_cs, LOW);
     sendByte(0x20); 
+    // Pad short strings with spaces (don't read past the terminator)
     for (int i = 0; i < 8; i++) {
-        sendByte(msg[i] ? msg[i] : ' ');
+        sendByte(*msg ? *msg++ : ' ');
     }
     digitalWrite(_cs, HIGH);
 }
